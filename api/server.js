@@ -214,7 +214,7 @@ class MetricsTracker {
       health.statusCode = 'warning';
       health.recommendations.push('Multiple rate limit hits detected');
     }
-    if (this.metrics.totalMessagesFailed / this.metrics.totalMessagesAttempted > 0.2) {
+    if (this.metrics.totalMessagesAttempted >= 5 && this.metrics.totalMessagesFailed / this.metrics.totalMessagesAttempted > 0.2) {
       health.statusCode = 'critical';
       health.recommendations.push('Failure rate exceeds 20% - PAUSE OPERATIONS');
     }
@@ -557,14 +557,14 @@ initDb().then(db => {
 
   app.post('/api/campaigns/:id/start', auth, (req, res) => {
     if (engine.isRunning()) return res.status(409).json({ error: 'Engine already running' });
-    
-    // Safety check
+
+    // Auto-reset metrics if in critical state — login failures from previous runs
+    // should not permanently block new campaigns.
     const health = metricsTracker.getHealth();
     if (health.statusCode === 'critical') {
-      return res.status(400).json({ 
-        error: 'Cannot start - system is in critical state',
-        recommendation: 'Review error logs and resolve issues before continuing',
-      });
+      metricsTracker.reset();
+      rateLimiter.accountStats.clear();
+      engine.addLog('Metrics auto-reset (was critical) before new campaign start', req.params.id, null, 'warn');
     }
 
     const total = db.prepare('SELECT COUNT(*) AS c FROM accounts').get().c;
