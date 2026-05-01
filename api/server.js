@@ -1,5 +1,6 @@
-// api/server.js — InstaReach v3 Enhanced
+// api/server.js — InstaReach v3 Enhanced with Auto Session Detection
 // Implements comprehensive rate limiting, session management, monitoring, and safety features
+// AUTO DETECTS SESSION FILES IN data/sessions/ DIRECTORY
 require('dotenv').config();
 const express  = require('express');
 const cors     = require('cors');
@@ -7,6 +8,7 @@ const bcrypt   = require('bcryptjs');
 const jwt      = require('jsonwebtoken');
 const path     = require('path');
 const fs       = require('fs');
+const os       = require('os');
 const { v4: uuidv4 } = require('uuid');
 const { initDb }     = require('../lib/db');
 const engine         = require('../lib/dmEngine');
@@ -14,6 +16,59 @@ const engine         = require('../lib/dmEngine');
 const app        = express();
 const PORT       = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || process.env.ADMIN_PASSWORD || 'instraeach_v3_secret';
+
+// ── Session directory configuration ──────────────────────────────
+const IS_VERCEL   = !!(process.env.VERCEL || process.env.VERCEL_ENV);
+const SESSION_DIR = IS_VERCEL
+  ? path.join(os.tmpdir(), 'ig_sessions')
+  : path.join(process.cwd(), 'data', 'sessions');
+
+// Ensure session directory exists
+if (!fs.existsSync(SESSION_DIR)) {
+  try {
+    fs.mkdirSync(SESSION_DIR, { recursive: true });
+    console.log(`[Sessions] Directory created: ${SESSION_DIR}`);
+  } catch (e) {
+    console.warn(`[Sessions] Failed to create directory: ${e.message}`);
+  }
+}
+
+// ── Function: Auto-detect session files ──────────────────────────
+function getExistingSessionFile(username) {
+  const clean = username.toLowerCase().replace('@', '').trim();
+  const sessionFile = path.join(SESSION_DIR, `session_${clean}.json`);
+  
+  if (fs.existsSync(sessionFile)) {
+    try {
+      const stat = fs.statSync(sessionFile);
+      const sizeKb = (stat.size / 1024).toFixed(2);
+      console.log(`[Sessions] Found session for @${clean}: ${sizeKb} KB`);
+      return `session_${clean}`;
+    } catch (e) {
+      console.warn(`[Sessions] Failed to stat session file: ${e.message}`);
+      return null;
+    }
+  }
+  
+  return null;
+}
+
+// ── Function: List all available sessions ────────────────────────
+function listAvailableSessions() {
+  try {
+    if (!fs.existsSync(SESSION_DIR)) {
+      return [];
+    }
+    const files = fs.readdirSync(SESSION_DIR);
+    const sessions = files
+      .filter(f => f.startsWith('session_') && f.endsWith('.json'))
+      .map(f => f.replace('session_', '').replace('.json', ''));
+    return sessions;
+  } catch (e) {
+    console.warn(`[Sessions] Failed to list sessions: ${e.message}`);
+    return [];
+  }
+}
 
 app.use(cors());
 app.use(express.json({ limit: '20mb' }));
@@ -355,6 +410,16 @@ initDb().then(db => {
     res.json(logs);
   });
 
+  // ── Sessions API (NEW) ──────────────────────────────────────────
+  app.get('/api/sessions/available', auth, (_req, res) => {
+    const sessions = listAvailableSessions();
+    res.json({
+      count: sessions.length,
+      sessions: sessions,
+      sessionDir: SESSION_DIR,
+    });
+  });
+
   // ── Stats ─────────────────────────────────────────────────────
   app.get('/api/stats', auth, (_req, res) => {
     const totalAccounts   = db.prepare('SELECT COUNT(*) AS c FROM accounts').get().c;
@@ -397,6 +462,11 @@ initDb().then(db => {
       const check = rateLimiter.check(r.id);
       r.rateLimitStatus = check;
       r.sessionStatus = sessionManager.sessions.has(r.id) ? 'active' : 'inactive';
+      
+      // CHECK IF SESSION FILE EXISTS
+      const existingSession = getExistingSessionFile(r.username);
+      r.sessionFileExists = existingSession ? true : false;
+      r.sessionFileName = existingSession || null;
     });
     res.json(rows);
   });
@@ -410,12 +480,41 @@ initDb().then(db => {
     const total = db.prepare('SELECT COUNT(*) AS c FROM accounts').get().c;
     if (total >= 100) return res.status(400).json({ error: 'Max 100 accounts reached' });
     const id = uuidv4();
-    db.prepare('INSERT INTO accounts (id,username,session_id,password,daily_limit,notes) VALUES (?,?,?,?,?,?)').run(id, clean, session_id, password || session_id, daily_limit, notes);
+    
+    // ── AUTO-DETECT SESSION FILE ──────────────────────────────
+    let final_session_id = session_id;
+    let final_password = password;
+    
+    // If both are empty, check if session file exists in directory
+    if (!session_id && !password) {
+      const existingSession = getExistingSessionFile(clean);
+      if (existingSession) {
+        final_session_id = existingSession;
+        console.log(`[Accounts] Auto-detected session for @${clean}: ${existingSession}`);
+      }
+    }
+    // If session_id provided, use it
+    else if (session_id) {
+      final_session_id = session_id;
+    }
+    // If password provided, use it
+    else if (password) {
+      final_password = password;
+    }
+    
+    db.prepare('INSERT INTO accounts (id,username,session_id,password,daily_limit,notes) VALUES (?,?,?,?,?,?)')
+      .run(id, clean, final_session_id, final_password, daily_limit, notes);
     
     // Create session
     sessionManager.createSession(id, { username: clean });
     
-    res.json({ id, username: clean, sessionStatus: 'active' });
+    res.json({ 
+      id, 
+      username: clean, 
+      sessionStatus: 'active',
+      sessionFileDetected: final_session_id ? true : false,
+      sessionId: final_session_id || null,
+    });
   });
 
   app.post('/api/accounts/bulk', auth, (req, res) => {
@@ -431,8 +530,22 @@ initDb().then(db => {
         const exists = db.prepare('SELECT id FROM accounts WHERE username=?').get(clean);
         if (exists) { skipped++; continue; }
         const id = uuidv4();
+        
+        // ── AUTO-DETECT SESSION FILE ──────────────────────────────
+        let final_session_id = acc.session_id || '';
+        let final_password = acc.password || acc.session_id || '';
+        
+        // If both empty, try to auto-detect
+        if (!final_session_id && !final_password) {
+          const existingSession = getExistingSessionFile(clean);
+          if (existingSession) {
+            final_session_id = existingSession;
+            console.log(`[Bulk] Auto-detected session for @${clean}`);
+          }
+        }
+        
         db.prepare('INSERT INTO accounts (id,username,session_id,password,daily_limit,notes) VALUES (?,?,?,?,?,?)')
-          .run(id, clean, acc.session_id || '', acc.password || acc.session_id || '', acc.daily_limit || 50, acc.notes || '');
+          .run(id, clean, final_session_id, final_password, acc.daily_limit || 50, acc.notes || '');
         sessionManager.createSession(id, { username: clean });
         added++;
       } catch { skipped++; }
@@ -492,7 +605,7 @@ initDb().then(db => {
 
     db.prepare('DELETE FROM accounts').run();
 
-    let added = 0, skipped = 0;
+    let added = 0, skipped = 0, autoDetected = 0;
     const seen = new Set();
     for (const acc of accounts) {
       try {
@@ -501,15 +614,32 @@ initDb().then(db => {
         seen.add(clean);
         if (added >= 100) { skipped++; continue; }
         const id = uuidv4();
-        const pwd = acc.password || acc.Password || acc.session_id || acc.Session_ID || '';
-        const sid = acc.session_id || acc.Session_ID || '';
+        
+        // ── AUTO-DETECT SESSION FILE ──────────────────────────────
+        let final_session_id = acc.session_id || acc.Session_ID || '';
+        let final_password = acc.password || acc.Password || '';
+        
+        // If both empty, try to auto-detect session file
+        if (!final_session_id && !final_password) {
+          const existingSession = getExistingSessionFile(clean);
+          if (existingSession) {
+            final_session_id = existingSession;
+            autoDetected++;
+            console.log(`[Upload] Auto-detected session for @${clean}`);
+          }
+        }
+        // Fallback: use provided password or session_id
+        else if (!final_password && final_session_id) {
+          final_password = final_session_id;
+        }
+        
         db.prepare('INSERT INTO accounts (id,username,session_id,password,daily_limit,notes) VALUES (?,?,?,?,?,?)')
-          .run(id, clean, sid, pwd, parseInt(acc.daily_limit || acc.Daily_Limit) || 50, acc.notes || acc.Notes || '');
+          .run(id, clean, final_session_id, final_password, parseInt(acc.daily_limit || acc.Daily_Limit) || 50, acc.notes || acc.Notes || '');
         sessionManager.createSession(id, { username: clean });
         added++;
       } catch { skipped++; }
     }
-    res.json({ ok: true, added, skipped, total: added });
+    res.json({ ok: true, added, skipped, autoDetected, total: added });
   });
 
   // ── Campaigns ─────────────────────────────────────────────────
@@ -773,6 +903,8 @@ initDb().then(db => {
     console.log(`[InstaReach v3] Server → http://localhost:${PORT}`);
     console.log(`[InstaReach v3] Ping   → http://localhost:${PORT}/ping`);
     console.log(`[InstaReach v3] Health → http://localhost:${PORT}/api/health`);
+    console.log(`[InstaReach v3] Sessions → ${SESSION_DIR}`);
+    console.log(`[InstaReach v3] Available sessions: ${listAvailableSessions().join(', ') || 'none'}`);
     console.log(`[InstaReach v3] Safety limits configured:`, SAFETY_CONFIG);
   });
 
