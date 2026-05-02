@@ -1,256 +1,420 @@
 #!/usr/bin/env python3
 """
-lib/ig_bridge.py - Instagram API Bridge using instagrapi
-Handles: login, search, DM sending, inbox checking
-Output: JSON responses for Node.js
+ig_bridge.py — InstaReach v3 Enhanced
+Comprehensive error handling, detection avoidance, and safety features
 """
+import sys, json, os, base64, tempfile, time, random
 
-import json
-import sys
-import os
-from pathlib import Path
-from instagrapi import Client
-from instagrapi.exceptions import (
-    LoginRequired,
-    InvalidPassword,
-    PleaseLoginAgain,
-    UserNotFound,
-    UserIdNotInteger,
-    ChallengeRequired,
-)
 
-def classify_error(e):
-    """Classify error type"""
-    msg = str(e).lower()
-    if 'challenge' in msg or 'checkpoint' in msg:
-        return 'session_expired'
-    if 'rate' in msg or '429' in msg:
+def load_client(username, session_file, password=None):
+    """Load Instagram client with session management and error handling"""
+    from instagrapi import Client
+    cl = Client()
+    # Human-like delays (2-5 seconds between API calls)
+    cl.delay_range = [2, 5]
+    
+    # Load existing session if available
+    if session_file and os.path.exists(session_file):
+        try:
+            cl.load_settings(session_file)
+            cl.account_info()
+            cl.dump_settings(session_file)
+            return cl
+        except Exception:
+            # Session expired or invalid, fall through to login
+            pass
+    
+    # Fresh login with password
+    if password:
+        try:
+            cl.login(username, password)
+            if session_file:
+                os.makedirs(os.path.dirname(session_file), exist_ok=True)
+                cl.dump_settings(session_file)
+            return cl
+        except Exception as e:
+            err_str = str(e).lower()
+            if 'challenge' in err_str:
+                raise RuntimeError(f"Challenge required for @{username}. Verify via Instagram app.")
+            elif '401' in err_str or 'invalid' in err_str.lower():
+                raise RuntimeError(f"Invalid credentials for @{username}")
+            else:
+                raise RuntimeError(f"Login failed for @{username}: {e}")
+    
+    raise RuntimeError(f"No valid session and no password for @{username}")
+
+
+def prepare_image(image_b64, image_ext):
+    """
+    Decode base64 image, optimize for Instagram, save to tmp file.
+    Instagram DM photo specs: Square or landscape (4:5 to 1.91:1 aspect ratio)
+    """
+    if not image_b64:
+        return None
+    
+    try:
+        img_bytes = base64.b64decode(image_b64)
+    except Exception as e:
+        raise RuntimeError(f"Invalid base64 image: {e}")
+    
+    try:
+        from PIL import Image
+        import io
+        
+        img = Image.open(io.BytesIO(img_bytes))
+        
+        # Convert to RGB (removes alpha channel if PNG)
+        if img.mode in ('RGBA', 'P', 'LA'):
+            bg = Image.new('RGB', img.size, (255, 255, 255))
+            if img.mode == 'P':
+                img = img.convert('RGBA')
+            bg.paste(img, mask=img.split()[-1] if img.mode in ('RGBA', 'LA') else None)
+            img = bg
+        elif img.mode != 'RGB':
+            img = img.convert('RGB')
+        
+        # Optimize dimensions for Instagram DM
+        w, h = img.size
+        
+        # Ensure minimum size (320px) and reasonable max (2000px)
+        min_size = 320
+        max_size = 2000
+        
+        if w < min_size or h < min_size:
+            scale = max(min_size/w, min_size/h)
+            w, h = int(w*scale), int(h*scale)
+        
+        if w > max_size or h > max_size:
+            scale = min(max_size/w, max_size/h)
+            w, h = int(w*scale), int(h*scale)
+        
+        img = img.resize((w, h), Image.LANCZOS)
+        
+        # Save as JPEG with high quality for DM
+        buf = io.BytesIO()
+        img.save(buf, format='JPEG', quality=92)
+        img_bytes = buf.getvalue()
+        image_ext = 'jpg'
+        
+    except ImportError:
+        # PIL not available — use raw bytes
+        pass
+    except Exception as e:
+        raise RuntimeError(f"Image processing error: {e}")
+    
+    tmp = tempfile.NamedTemporaryFile(suffix=f'.{image_ext}', delete=False)
+    tmp.write(img_bytes)
+    tmp.close()
+    return tmp.name
+
+
+def classify_error(error_str):
+    """Classify Instagram errors for appropriate response"""
+    err_lower = error_str.lower()
+    
+    # Rate limiting
+    if '429' in error_str or 'throttle' in err_lower or 'rate' in err_lower:
         return 'rate_limited'
-    if 'invalid' in msg or 'password' in msg or '401' in msg:
-        return 'login_failed'
-    if 'not found' in msg or 'user_not_found' in msg:
+    
+    # Session/auth issues
+    if 'challenge' in err_lower or '401' in error_str or 'unauthorized' in err_lower:
+        return 'session_expired'
+    
+    # User not found
+    if 'not found' in err_lower or 'user_not_found' in err_lower:
         return 'user_not_found'
-    if 'block' in msg or 'restricted' in msg:
+    
+    # Blocked
+    if 'block' in err_lower or 'restricted' in err_lower:
         return 'blocked'
-    if 'spam' in msg or 'action_blocked' in msg:
+    
+    # Spam detection
+    if 'spam' in err_lower or 'action_blocked' in err_lower:
         return 'spam_detected'
+    
     return 'unknown'
 
-def json_response(ok, **kwargs):
-    """Generate standardized JSON response"""
-    response = {'ok': ok}
-    response.update(kwargs)
-    print(json.dumps(response))
-    sys.exit(0)
-
-def json_error(error_msg, reason='unknown', **kwargs):
-    """Generate error response"""
-    response = {
-        'ok': False,
-        'error': error_msg,
-        'reason': reason,
-    }
-    response.update(kwargs)
-    print(json.dumps(response))
-    sys.exit(1)
-
-def cmd_login(username, password, session_dir):
-    """Login and save session"""
+def cmd_login(data):
+    """Login to Instagram account"""
     try:
-        print(f'[ig_bridge] Logging in as @{username}...', file=sys.stderr)
-        
-        # Create client
-        cl = Client()
-        
-        # Login
-        cl.login(username, password)
-        print(f'[ig_bridge] ✅ Login successful! User ID: {cl.user_id}', file=sys.stderr)
-        
-        # Get user info
-        try:
-            user_info = cl.account_info()
-            follower_count = user_info.follower_count or 0
-        except:
-            follower_count = 0
-        
-        # Save session
-        try:
-            session_file = Path(session_dir) / f'session_{username.lower()}.json'
-            session_file.parent.mkdir(parents=True, exist_ok=True)
-            cl.dump_settings(str(session_file))
-            print(f'[ig_bridge] Session saved: {session_file}', file=sys.stderr)
-        except Exception as e:
-            print(f'[ig_bridge] Warning: Could not save session: {e}', file=sys.stderr)
-        
-        json_response(
-            True,
-            username=username.lower(),
-            user_id=str(cl.user_id),
-            follower_count=follower_count,
-            method='password'
+        username = data["username"]
+        password = data.get("password", "")
+        session_file = data.get("session_file", "")
+
+        cl = load_client(username, session_file, password)
+
+        # Verify successful login
+        user_info = cl.account_info()
+
+        user_id = str(getattr(user_info, "pk", ""))
+
+        follower_count = (
+            getattr(user_info, "follower_count", None)
+            or getattr(user_info, "followers_count", None)
         )
-    
-    except InvalidPassword:
-        json_error('Invalid password', reason='login_failed')
-    except LoginRequired:
-        json_error('Login required', reason='login_failed')
-    except Exception as e:
-        json_error(str(e), reason=classify_error(e))
 
-def cmd_search(username, password, keyword, session_dir):
-    """Search for users"""
+        if follower_count is None:
+            try:
+                profile = cl.user_info_by_username(username)
+                follower_count = (
+                    getattr(profile, "follower_count", None)
+                    or getattr(profile, "followers_count", None)
+                    or 0
+                )
+            except Exception:
+                follower_count = 0
+
+        return {
+            "ok": True,
+            "username": username,
+            "user_id": user_id,
+            "follower_count": follower_count,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "error": str(e),
+            "reason": "login_failed"
+        }
+
+
+def cmd_search(data):
+    """Search for users by hashtag and direct search"""
+    username = data["username"]
+    password = data.get("password", "")
+    session_file = data.get("session_file", "")
+    keyword = data["keyword"]
+    
     try:
-        print(f'[ig_bridge] Searching for "{keyword}" as @{username}...', file=sys.stderr)
-        
-        # Create and login
-        cl = Client()
-        cl.login(username, password)
-        
+        cl = load_client(username, session_file, password)
         users = set()
         
-        # Try hashtag search (most reliable)
-        try:
-            print(f'[ig_bridge] Hashtag search: #{keyword}', file=sys.stderr)
-            medias = cl.hashtag_medias_recent(keyword.replace(' ', '').lower(), amount=40)
-            for media in medias:
-                if media.user and media.user.username:
-                    users.add(media.user.username.lower())
-                if len(users) >= 25:
-                    break
-        except Exception as e:
-            print(f'[ig_bridge] Hashtag search failed: {e}', file=sys.stderr)
+        # Search via hashtags (most reliable)
+        hashtag = keyword.replace(" ", "").replace("-", "").lower()
+        hashtag2 = keyword.replace(" ", "_").lower()
         
-        # Fallback: Direct user search
-        if len(users) < 10:
+        search_strategies = [
+            (cl.hashtag_medias_recent, hashtag, 30),
+            (cl.hashtag_medias_top, hashtag, 20),
+            (cl.hashtag_medias_recent, hashtag2, 20),
+        ]
+        
+        for fn, arg, amt in search_strategies:
             try:
-                print(f'[ig_bridge] User search: {keyword}', file=sys.stderr)
-                search_results = cl.user_search(keyword)
-                for user in search_results[:20]:
-                    if user.username:
-                        users.add(user.username.lower())
-            except Exception as e:
-                print(f'[ig_bridge] User search failed: {e}', file=sys.stderr)
+                for m in fn(arg, amount=amt):
+                    if hasattr(m, 'user') and m.user:
+                        users.add(m.user.username)
+                    if len(users) >= 20:
+                        break
+            except Exception:
+                pass
+            
+            if len(users) >= 20:
+                break
+            
+            # Add human-like delay between searches
+            time.sleep(random.uniform(1, 3))
         
-        print(f'[ig_bridge] Found {len(users)} users', file=sys.stderr)
-        json_response(True, users=list(users), count=len(users))
-    
+        # Fallback: direct user search
+        if len(users) < 5:
+            try:
+                for u in cl.search_users(keyword, count=15):
+                    users.add(u.username)
+            except Exception:
+                pass
+        
+        return {
+            "ok": True,
+            "users": list(users),
+            "count": len(users),
+        }
     except Exception as e:
-        json_error(str(e), reason=classify_error(e), users=[])
+        return {
+            "ok": False,
+            "error": str(e),
+            "users": [],
+            "reason": classify_error(str(e))
+        }
 
-def cmd_send_dm(username, password, to_username, message, image_b64, session_dir):
-    """Send DM to user"""
+
+def cmd_send_dm(data):
+    """Send direct message with optional image"""
+    username = data["username"]
+    password = data.get("password", "")
+    session_file = data.get("session_file", "")
+    to_username = data["to_username"]
+    message = data["message"]
+    image_b64 = data.get("image_b64", "").strip()
+    image_ext = data.get("image_ext", "jpg")
+    
+    tmp_path = None
+    image_warning = None
+    
     try:
-        print(f'[ig_bridge] Sending DM from @{username} to @{to_username}', file=sys.stderr)
-        
-        # Create and login
-        cl = Client()
-        cl.login(username, password)
+        cl = load_client(username, session_file, password)
         
         # Get recipient user ID
         try:
-            print(f'[ig_bridge] Looking up @{to_username}', file=sys.stderr)
-            recipient = cl.user_info_by_username(to_username.lower())
-            user_id = recipient.pk
-            print(f'[ig_bridge] Found @{to_username} (ID: {user_id})', file=sys.stderr)
-        except UserNotFound:
-            json_error(f'User @{to_username} not found', reason='user_not_found')
+            user_id = cl.user_id_from_username(to_username)
         except Exception as e:
-            json_error(f'User lookup failed: {e}', reason='user_not_found')
+            if 'not found' in str(e).lower():
+                return {
+                    "ok": False,
+                    "reason": "user_not_found",
+                    "error": f"User @{to_username} not found"
+                }
+            raise e
         
         # Send image if provided
-        if image_b64 and image_b64.strip():
+        if image_b64:
             try:
-                print(f'[ig_bridge] Sending image', file=sys.stderr)
-                import base64
-                img_data = base64.b64decode(image_b64)
-                # Save temp file
-                temp_path = Path('/tmp') / f'insta_msg_{int(__import__("time").time())}.jpg'
-                temp_path.write_bytes(img_data)
-                # Send
-                cl.direct_send_photo(user_ids=[user_id], photo_path=str(temp_path))
-                temp_path.unlink()
-                print(f'[ig_bridge] Image sent', file=sys.stderr)
-            except Exception as e:
-                print(f'[ig_bridge] Image send failed: {e}', file=sys.stderr)
+                tmp_path = prepare_image(image_b64, image_ext)
+                from pathlib import Path
+                cl.direct_send_photo(Path(tmp_path), user_ids=[user_id])
+                # Add human-like delay
+                time.sleep(random.uniform(1, 2))
+            except Exception as ie:
+                # Preserve warning but continue with text
+                image_warning = f"Image send failed: {ie}"
+            finally:
+                if tmp_path and os.path.exists(tmp_path):
+                    try:
+                        os.unlink(tmp_path)
+                    except:
+                        pass
+                    tmp_path = None
         
         # Send text message
         if message:
-            print(f'[ig_bridge] Sending text message', file=sys.stderr)
             cl.direct_send(message, user_ids=[user_id])
-            print(f'[ig_bridge] Message sent', file=sys.stderr)
         
-        json_response(True, to_username=to_username.lower(), message_sent=True)
+        return {
+            "ok": True,
+            "message_sent": True,
+            "to_username": to_username,
+            "image_warning": image_warning,
+        }
     
     except Exception as e:
-        json_error(str(e), reason=classify_error(e))
+        error_reason = classify_error(str(e))
+        return {
+            "ok": False,
+            "reason": error_reason,
+            "error": str(e),
+        }
+    
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except:
+                pass
 
-def cmd_inbox(username, password, session_dir):
-    """Check inbox"""
+
+def cmd_inbox(data):
+    """Fetch inbox messages from recent conversations"""
     try:
-        print(f'[ig_bridge] Checking inbox for @{username}', file=sys.stderr)
+        username = data["username"]
+        password = data.get("password", "")
+        session_file = data.get("session_file", "")
         
-        # Create and login
-        cl = Client()
-        cl.login(username, password)
-        
+        cl = load_client(username, session_file, password)
         messages = []
         
-        # Get direct threads
-        try:
-            threads = cl.direct_threads(amount=20)
-            for thread in threads:
-                if not thread.users:
-                    continue
-                other = thread.users[0]
-                
-                # Get messages from other user
-                for msg in (thread.messages or [])[-10:]:
-                    if msg.user_id != cl.user_id and msg.text:
-                        messages.append({
-                            'from_username': other.username.lower(),
-                            'text': msg.text,
-                            'timestamp': str(msg.timestamp),
-                        })
-        except Exception as e:
-            print(f'[ig_bridge] Inbox fetch failed: {e}', file=sys.stderr)
+        # Fetch recent threads
+        for thread in cl.direct_threads(amount=20):
+            # Get the other user in the thread
+            other = thread.users[0] if thread.users else None
+            if not other:
+                continue
+            
+            # Extract messages from them
+            for msg in thread.messages:
+                # Check if message is from the other user and has text
+                if str(msg.user_id) == str(other.pk) and msg.text:
+                    messages.append({
+                        "from_username": other.username,
+                        "text": msg.text,
+                        "timestamp": str(msg.timestamp),
+                    })
+            
+            # Add human-like delay between thread fetches
+            time.sleep(random.uniform(0.5, 1.5))
         
-        print(f'[ig_bridge] Found {len(messages)} messages', file=sys.stderr)
-        json_response(True, messages=messages, message_count=len(messages))
-    
+        return {
+            "ok": True,
+            "messages": messages,
+            "message_count": len(messages),
+        }
     except Exception as e:
-        json_error(str(e), reason=classify_error(e), messages=[])
+        return {
+            "ok": False,
+            "error": str(e),
+            "messages": [],
+            "reason": classify_error(str(e))
+        }
+
+
+def cmd_check_session(data):
+    """Verify if session is still valid"""
+    try:
+        username = data["username"]
+        session_file = data.get("session_file", "")
+        
+        if not session_file or not os.path.exists(session_file):
+            return {
+                "ok": False,
+                "valid": False,
+                "reason": "no_session_file"
+            }
+        
+        from instagrapi import Client
+        cl = Client()
+        cl.load_settings(session_file)
+        
+        # Quick validation
+        cl.account_info()
+        
+        return {
+            "ok": True,
+            "valid": True,
+            "username": username,
+        }
+    except Exception as e:
+        return {
+            "ok": False,
+            "valid": False,
+            "reason": classify_error(str(e)),
+            "error": str(e)
+        }
+
 
 def main():
-    if len(sys.argv) < 3:
-        json_error('Invalid arguments', reason='invalid_args')
-    
-    cmd = sys.argv[1]
-    
     try:
-        if cmd == 'login' and len(sys.argv) >= 5:
-            cmd_login(sys.argv[2], sys.argv[3], sys.argv[4])
-        
-        elif cmd == 'search' and len(sys.argv) >= 6:
-            cmd_search(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5])
-        
-        elif cmd == 'send_dm' and len(sys.argv) >= 7:
-            cmd_send_dm(
-                sys.argv[2],  # username
-                sys.argv[3],  # password
-                sys.argv[4],  # to_username
-                sys.argv[5],  # message
-                sys.argv[6],  # image_b64
-                sys.argv[7]   # session_dir
-            )
-        
-        elif cmd == 'inbox' and len(sys.argv) >= 5:
-            cmd_inbox(sys.argv[2], sys.argv[3], sys.argv[4])
-        
-        else:
-            json_error(f'Unknown command: {cmd}', reason='unknown_command')
+        data = json.loads(sys.stdin.read().strip())
+    except Exception:
+        print(json.dumps({"ok": False, "error": "Invalid JSON"}))
+        sys.exit(1)
     
-    except Exception as e:
-        json_error(str(e), reason='unknown_error')
+    handlers = {
+        "login": cmd_login,
+        "search": cmd_search,
+        "send_dm": cmd_send_dm,
+        "inbox": cmd_inbox,
+        "check_session": cmd_check_session,
+    }
+    
+    handler = handlers.get(data.get("cmd", ""))
+    if not handler:
+        print(json.dumps({
+            "ok": False,
+            "error": f"Unknown command: {data.get('cmd')}"
+        }))
+        sys.exit(1)
+    
+    result = handler(data)
+    print(json.dumps(result))
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
