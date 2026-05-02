@@ -17,11 +17,22 @@ const app        = express();
 const PORT       = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET || process.env.ADMIN_PASSWORD || 'instraeach_v3_secret';
 
+
+process.on('uncaughtException', (err) => {
+  console.error('UNCAUGHT EXCEPTION:', err);
+});
+
+process.on('unhandledRejection', (err) => {
+  console.error('UNHANDLED REJECTION:', err);
+});
+
 // ── Session directory configuration ──────────────────────────────
 const IS_VERCEL   = !!(process.env.VERCEL || process.env.VERCEL_ENV);
 const SESSION_DIR = IS_VERCEL
   ? path.join(os.tmpdir(), 'ig_sessions')
   : path.join(process.cwd(), 'data', 'sessions');
+
+
 
 // Ensure session directory exists
 if (!fs.existsSync(SESSION_DIR)) {
